@@ -161,6 +161,47 @@ def load_sample_documents():
         except Exception as e:
             print(f"Error reading guideline file: {e}")
 
+    # 4. PDFファイルの読み込み（新規）
+    # 「source_docs」フォルダ内のPDFファイルをスキャン
+    if xml_docs_dir.exists():
+        try:
+            import pypdf
+            print(f"Scanning PDF documents in: {xml_docs_dir}")
+            for file_path in xml_docs_dir.glob("*.pdf"):
+                try:
+                    print(f"Loading PDF: {file_path.name}")
+                    reader = pypdf.PdfReader(file_path)
+                    pdf_text = ""
+                    for page in reader.pages:
+                        extracted = page.extract_text()
+                        if extracted:
+                            pdf_text += extracted + "\n"
+                    
+                    # テキストが長すぎる場合は分割する（簡易チャンキング）
+                    chunk_size = 2000
+                    text_chunks = [pdf_text[i:i+chunk_size] for i in range(0, len(pdf_text), chunk_size)]
+                    
+                    for i, chunk in enumerate(text_chunks):
+                        metadata = {
+                            "title": file_path.stem + f" (Part {i+1})",
+                            "law_category": "Administrative Guideline/PDF",
+                            "section": "PDF Content",
+                            "tags": "PDF, Guideline",
+                            "source_type": "pdf",
+                            "filename": file_path.name
+                        }
+                        documents.append({
+                            "content": chunk,
+                            "metadata": metadata
+                        })
+                    print(f"Successfully loaded content from {file_path.name}")
+                except Exception as e:
+                    print(f"Error loading PDF {file_path}: {e}")
+        except ImportError:
+            print("pypdf is not installed. Skipping PDF loading.")
+        except Exception as e:
+            print(f"Error initializing PDF loader: {e}")
+
     return documents
 
 # 初期化時にサンプルドキュメントをロード
@@ -231,12 +272,24 @@ async def check_compliance(request: ComplianceCheckRequest) -> ComplianceCheckRe
              confidence_score = output["confidence_score"]
 
         # 【修正】適合・不適合に関わらず、AIの分析結果を詳細として返す
+        # 検索された根拠文書をEvidenceとして追加
+        evidence_list = []
+        if "retrieved_docs" in result:
+             r_docs = result["retrieved_docs"]
+             if r_docs and 'documents' in r_docs and r_docs['documents']:
+                 for i, doc_text in enumerate(r_docs['documents'][0]):
+                     meta = r_docs['metadatas'][0][i]
+                     evidence_list.append({
+                         "source": f"{meta.get('title')} {meta.get('section')}",
+                         "content": doc_text[:200] + "..." # 抜粋
+                     })
+
         violation = ViolationDetail(
             law="景品表示法 / 薬機法（分析結果参照）",
             violation_section="AI分析",
             details=irac_analysis, # ここにGeminiのIRAC分析が常に入る
             severity="high" if not is_compliant else "low",
-            evidence=[]
+            evidence=evidence_list
         )
         violations.append(violation)
 

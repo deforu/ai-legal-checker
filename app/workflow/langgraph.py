@@ -148,7 +148,7 @@ def retrieve_documents(state: WorkflowState):
         "debug_info": {
             "generated_query": f"Statute: {statute_query} | Guideline: {guideline_query}",
             "retrieved_doc_count": len(final_docs["documents"][0]),
-            "retrieved_doc_titles": [m.get("title", "Unknown") for m in final_docs["metadatas"][0]]
+            "retrieved_doc_titles": [f"{m.get('title', 'Unknown')} - {m.get('section', '')}" for m in final_docs["metadatas"][0]]
         }
     }
 
