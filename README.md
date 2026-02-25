@@ -1,29 +1,35 @@
 # AI Legal Checker (薬機法・景表法チェックプロトタイプ)
 
-広告テキストなどが日本の法律（**薬機法**、**景品表示法**など）に違反していないかをチェックし、違反箇所と代替表現（言い換え）を提案するAIシステムのプロトタイプです。
+広告テキストなどが日本の法律（**薬機法**、**景品表示法**など）に違反していないかをチェックし、違反箇所と代替表現（言い換え）を提案する高性能なAIシステムのプロトタイプです。
 
-## 🚀 主な機能
+## 🚀 進化した主な機能
 
-1.  **高度な法的検索 (RAG)**
-    - **マルチクエリ検索**: ユーザーの入力から「条文検索用」と「ガイドライン検索用」の2つのクエリを生成し、多角的に情報を収集します。
-    - **永続化ベクトルストア**: ChromaDBを使用し、再起動後もデータを保持（重複ロード防止機能付き）。
-    - **データソース (`source_docs`)**: 薬機法、景品表示法などの全文XMLに加え、厚生労働省や消費者庁のWebガイドラインもインデックス化。
+1.  **次世代RAG検索 (Legal Document Search)**
+    - **法域別スロット検索**: 「薬機法本法」「景表法本法」「運用ガイドライン/事例集」の3つの独立スロットで検索を実行。特定の法律に偏ることなく、多角的なエビデンスを収集します。
+    - **分析戦略の自律決定**: AIが入力を解析し、検索キーワードや各法域への重み付け（スロット配分）を動的に最適化します。
+    - **多言語Embedding**: `paraphrase-multilingual-MiniLM-L12-v2` を採用し、日本語の法的ニュアンスを正確に捉えた高度なセマンティック検索を実現。
 
-2.  **堅牢なAI推論 (Multi-LLM & Fallback)**
-    - **メイン**: Google Gemini (Flash/Pro) による高速推論。
-    - **フォールバック**: Geminiがレート制限 (429 Error) に達した場合、自動的に **OpenAI (GPT-4o)** に切り替わり、処理を継続します。
-    - **IRACフレームワーク**: 法的三段論法（Issue, Rule, Application, Conclusion）を用いた論理的な法的分析。
+2.  **高速・効率的なベクトルDB運用**
+    - **起動高速化**: 既にベクトルストアにデータが存在する場合、再インデックスをスキップして即時にサービスを開始します。
+    - **手動リセット**: 環境変数 `FORCE_REINDEX=true` を指定することで、いつでも最新の `source_docs` からDBを再構築可能です。
 
-3.  **エージェンティック・ワークフロー**
-    - **LangGraph** を使用し、検索 → 分析 → 推論 → 提案 のフローを制御。
+3.  **精緻な法的分析 (IRACフレームワーク)**
+    - **IRAC方式**: 論点 (Issue) → 根拠 (Rule) → あてはめ (Application) → 結論 (Conclusion) の厳格な法的思考プロセスを追体験可能な形式で提供。
+    - **ハイブリッド判定**: 構造化された法的思考と、AIによるマーケティング視点の改善提案を融合。
+
+4.  **運用コストの可視化 (Token Tracking)**
+    - **トークン計測**: 内部の各ステップ（検索・分析・提案）で消費されたトークン量をレスポンスに含め、実運用時のコスト予測を支援します。
 
 ## 🛠️ 技術スタック
 
 - **Backend**: Python 3.12+, FastAPI
 - **LLM Orchestration**: LangChain, LangGraph
-- **LLMs**: Google Gemini (via `langchain-google-genai`), OpenAI GPT-4o (via `langchain-openai`)
-- **Vector Store**: ChromaDB
-- **Search**: Tavily (Optional fallback)
+- **Embedding**: Sentence Transformers (`paraphrase-multilingual-MiniLM-L12-v2`)
+- **LLMs**: Google Gemini 1.5 Flash (Main), OpenAI GPT-4o (Fallback)
+- **Vector Store**: ChromaDB (Persistent)
+- **Data Source**: 
+    - 薬機法、景品表示法 XML (e-Gov)
+    - 各種広告ガイドライン、違反事例集 (PDF/Markdown)
 
 ## 📂 プロジェクト構造
 
@@ -31,96 +37,81 @@
 .
 ├── app/
 │   ├── api/            # APIエンドポイント定義
-│   ├── models/         # Pydanticモデル
-│   ├── rag/            # RAGロジック (retrieval.py, vector_store.py)
-│   └── workflow/       # LangGraphワークフロー定義
-├── source_docs/        # 法律データソース (XML定義, URLリスト)
-├── data/               # 生成されたベクトルDB (chroma_db)
-├── tests/              # テストコード
+│   ├── models/         # Pydanticモデル (Request/Response)
+│   ├── rag/            # 検索・Embedding・DBロジック
+│   └── workflow/       # LangGraphによる推論フロー制御
+├── source_docs/        # 法律・ガイドライン等の生データ
+├── db/                 # ベクトルDB (chroma_db) 永続化ディレクトリ
+├── 00_マスターノート/   # プロジェクトの設計・タスク・仕様書
 ├── requirements.txt    # 依存ライブラリ
-├── run_server.bat      # サーバー起動スクリプト
-└── .env                # 環境変数 (APIキー等)
+├── .env                # 環境変数
+└── run_server.bat      # サーバー起動スクリプト
 ```
 
-## 🏁 セットアップ手順
+## 🏁 セットアップと実行
 
-### 1. 前提条件
-- Python 3.12以上がインストールされていること
-- Google AI Studio API Key (Gemini用)
-- OpenAI API Key (フォールバック用)
-
-### 2. インストール
-
+### 1. インストール
 ```powershell
-# リポジトリのクローン
-git clone https://github.com/deforu/ai-legal-checker.git
-cd ai-legal-checker
-
-# 仮想環境の作成
 python -m venv .venv
-
-# 仮想環境の有効化 (Windows)
-.venv\Scripts\activate
-
-# 依存ライブラリのインストール
+. .venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-### 3. 環境変数の設定
-ルートディレクトリに `.env` ファイルを作成し、以下の情報を記述してください。
-
+### 2. 環境変数の設定 (`.env`)
 ```bash
 GOOGLE_API_KEY=your_gemini_api_key
 OPENAI_API_KEY=your_openai_api_key
-# TAVILY_API_KEY=your_tavily_key  # (オプション)
+# オプション: 初回起動時にDBを強制再構築する場合
+# FORCE_REINDEX=true
 ```
 
-### 4. 実行
-
-付属のバッチファイルで簡単にサーバーを起動できます。初回起動時に `source_docs` 内のデータを自動的にベクトルDBに取り込みます。
-
+### 3. 実行
 ```powershell
 .\run_server.bat
 ```
-
-起動後、APIサーバーは `http://127.0.0.1:8000` で待機します。
+APIサーバーは `http://127.0.0.1:8000` で待機します。
 
 ## 📖 使い方 (API)
 
-Postmanやcurlを使用して、以下のエンドポイントにリクエストを送信してください。
-
 **Endpoint**: `POST /api/v1/compliance/check`
 
-**Request Body**:
+### Request Body (JSON)
 ```json
 {
-  "data": "このサプリを飲むだけで、1ヶ月で10kg痩せました！しかも、癌も治るという噂です。"
+  "content": {
+    "type": "text",
+    "data": "美容外科医が選ぶ『信頼できるスキンケアブランド』第1位獲得！国内最高峰の品質を保証します。"
+  }
 }
 ```
 
-**Response (Example)**:
+### Response (Example)
 ```json
 {
-    "status": "success",
-    "result": {
-        "compliant": false,
-        "violations": [
-            {
-                "law": "薬機法",
-                "violation_section": "第66条 (誇大広告)",
-                "details": "..."
-            }
-        ],
-        "recommendations": [
-            {
-                "revised_text": "...",
-                "reason": "..."
-            }
-        ]
+  "status": "success",
+  "result": {
+    "compliant": false,
+    "violations": [
+      {
+        "law": "薬機法 / 景品表示法",
+        "violation_section": "AI分析",
+        "details": "### 1. Issue...\n### 2. Rule...\n### 3. Application...\n### 4. Conclusion...",
+        "severity": "high",
+        "evidence": [...]
+      }
+    ],
+    "recommendations": [...],
+    "analysis_log": {
+      "token_usage": {
+        "input": 8150,
+        "output": 1819,
+        "total": 9969
+      }
     }
+  },
+  "processing_time": 45000
 }
 ```
 
-## ⚠️ 注意事項/免責
-
-本システムは技術検証用のプロトタイプであり、**法的助言を提供するものではありません**。
+## ⚠️ 免責事項
+本システムはプロトタイプであり、提供される情報は法的正確性を保証するものではありません。最終的な法規判断には弁護士等の専門家の確認が必要です。

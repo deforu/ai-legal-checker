@@ -18,3 +18,4 @@ lxml==5.2.2
 requests>=2.32.0
 openai>=1.35.10
 pypdf>=4.2.0
+sentence-transformers>=3.0.1
