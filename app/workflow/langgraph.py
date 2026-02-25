@@ -36,116 +36,147 @@ class WorkflowState(TypedDict):
     analysis_result: dict
     final_output: dict
     current_step: str
+    usage_metadata: list # 各ステップのトークン使用量を格納
     debug_info: dict
 
 # ノード関数の定義
 def retrieve_documents(state: WorkflowState):
     """
-    関連するsource_docsを検索するノード（検索クエリの生成を改善）
+    関連するsource_docsを検索するノード
+    薬機法・景表法・ガイドラインの3方向で独立検索し、本法を優先するブースティングを適用する。
     """
     input_text = state["input_text"]
     
-    # LLMを使用して検索クエリを拡張生成（条文用とガイドライン用に分ける）
+    # LLMを使用して3つの検索クエリを生成
     query_generation_prompt = f"""
     You are a legal search expert.
-    Based on the following input text, generate TWO distinct search queries to retrieve relevant legal provisions.
+    Based on the following input text, generate THREE distinct search queries to retrieve relevant legal provisions.
     
-    1. Statute Query: Focus on the Pharmaceutical and Medical Device Act (PMD Act) and the Act against Unjustifiable Premiums and Misleading Representations (Premiums and Representations Act). Use specific legal terms and article numbers.
-    2. Guideline Query: Focus on administrative guidelines, interpretation standards, and "Medical Drugs Guidelines". Use terms related to practical application and criteria.
+    1. Yakkiho Query: Focus on the Pharmaceutical and Medical Device Act (薬機法). Use specific terms like "第66条" or "誇大広告".
+    2. Kehyoho Query: Focus on the Act against Unjustifiable Premiums and Misleading Representations (景表法). Use specific terms like "第5条" or "優良誤認".
+    3. Guideline Query: Focus on administrative guidelines, Q&A, and practical standards.
 
     Input Text:
     "{input_text}"
 
     Instructions:
     1. Identify specific claims in the text that might violate the law.
-    2. **CRITICAL: Generate functionality PRIMARILY IN JAPANESE.**
+    2. **CRITICAL: Generate queries PRIMARILY IN JAPANESE.**
     3. Return the result in the following JSON format ONLY:
        {{
-           "statute_query": "...",
+           "yakkiho_query": "...",
+           "kehyoho_query": "...",
            "guideline_query": "..."
        }}
-    
-    Example Output:
-    {{
-        "statute_query": "薬機法 第66条 誇大広告 未承認医薬品 景品表示法 優良誤認",
-        "guideline_query": "医薬品等適正広告基準 効能効果の範囲 ダイエット 痩身 ガイドライン"
-    }}
     """
     
-    statute_query = ""
-    guideline_query = ""
+    queries = {"yakkiho_query": "", "kehyoho_query": "", "guideline_query": ""}
 
     try:
-        response_content = llm_gemini.invoke(query_generation_prompt).content.strip()
-        # Clean up code blocks if present
+        response = llm_gemini.invoke(query_generation_prompt)
+        response_content = response.content.strip()
+        usage = getattr(response, 'usage_metadata', {})
+        
         if "```json" in response_content:
             response_content = response_content.split("```json")[1].split("```")[0].strip()
         elif "```" in response_content:
              response_content = response_content.split("```")[1].split("```")[0].strip()
-        
         queries = json.loads(response_content)
-        statute_query = queries.get("statute_query", "")
-        guideline_query = queries.get("guideline_query", "")
-        
     except Exception as e:
-        print(f"Gemini API Error in retrieve_documents: {e}")
-        if llm_openai:
-             print("Switching to OpenAI for query generation...")
-             try:
-                response_content = llm_openai.invoke(query_generation_prompt).content.strip()
-                if "```json" in response_content:
-                    response_content = response_content.split("```json")[1].split("```")[0].strip()
-                elif "```" in response_content:
-                     response_content = response_content.split("```")[1].split("```")[0].strip()
-                queries = json.loads(response_content)
-                statute_query = queries.get("statute_query", "")
-                guideline_query = queries.get("guideline_query", "")
-             except Exception as oe:
-                 print(f"OpenAI API Error: {oe}")
-                 raise oe
-        else:
-             raise e
+        print(f"Query generation error: {e}")
+        usage = {}
+        # フォールバック
+        queries = {
+            "yakkiho_query": f"薬機法 {input_text[:50]}",
+            "kehyoho_query": f"景表法 {input_text[:50]}",
+            "guideline_query": f"ガイドライン {input_text[:50]}"
+        }
 
-    # 検索の実行（それぞれトップ10件を取得）
-    print(f"Executing Search 1 (Statute): {statute_query}")
-    # カテゴリ：01_statute かつ 本則(is_main_provision: True) に限定して検索
-    docs_statute = search_documents(statute_query, top_k=10, where={"$and": [{"category": "01_statute"}, {"is_main_provision": True}]})
+    # 各スロットの検索実行
+    top_k_per_slot = 7 # 少し多めに取ってからブースト・ソート・選択
+
+    print(f"Searching Yakkiho: {queries.get('yakkiho_query')}")
+    docs_yakkiho = search_documents(
+        queries.get('yakkiho_query', ""), 
+        top_k=top_k_per_slot, 
+        where={"law_group": "yakkiho"}
+    )
     
-    print(f"Executing Search 2 (Guideline): {guideline_query}")
-    # 条文以外（事例や運用基準）を対象に検索
-    docs_guideline = search_documents(guideline_query, top_k=10, where={"category": {"$ne": "01_statute"}})
+    print(f"Searching Kehyoho: {queries.get('kehyoho_query')}")
+    docs_kehyoho = search_documents(
+        queries.get('kehyoho_query', ""), 
+        top_k=top_k_per_slot, 
+        where={"law_group": "kehyoho"}
+    )
     
-    # 結果の統合と重複排除
+    # 3. ガイドライン
+    print(f"Searching Guidelines: {queries.get('guideline_query')}")
+    docs_guideline = search_documents(
+        queries.get('guideline_query', ""), 
+        top_k=top_k_per_slot, 
+        where={"law_group": "other"}
+    )
+
     merged_documents = []
     merged_metadatas = []
     seen_contents = set()
+
+    def process_and_boost(raw_docs, query_text):
+        if not raw_docs or 'documents' not in raw_docs or not raw_docs['documents']:
+            return []
+        
+        results = []
+        for i, doc_content in enumerate(raw_docs['documents'][0]):
+            if doc_content in seen_contents: continue
+            
+            metadata = raw_docs['metadatas'][0][i]
+            # ChromaDBの距離スコアが利用できない場合は順位スコア
+            base_score = 1.0 - (i * 0.1) 
+            
+            # 【ブースティング】
+            # A. 本法ブースト: タイトルに「施行令」「施行規則」「府令」が含まれない場合
+            is_main_act = not any(k in metadata.get('title', '') for k in ["施行令", "施行規則", "内閣府令", "府令"])
+            if is_main_act and metadata.get('category') == "01_statute":
+                base_score *= 1.5
+                print(f"  Boosting Main Act: {metadata.get('title')}")
+
+            # B. 条文番号一致ブースト
+            section = metadata.get('section', '')
+            if section in query_text and len(section) > 1:
+                base_score *= 1.3
+                print(f"  Boosting Section Match: {section}")
+
+            results.append({
+                "content": doc_content,
+                "metadata": metadata,
+                "score": base_score
+            })
+            seen_contents.add(doc_content)
+        
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results
+
+    # 各枠から4件ずつ抽出
+    slot_yakkiho = process_and_boost(docs_yakkiho, queries.get('yakkiho_query', ""))[:4]
+    slot_kehyoho = process_and_boost(docs_kehyoho, queries.get('kehyoho_query', ""))[:4]
+    slot_guideline = process_and_boost(docs_guideline, queries.get('guideline_query', ""))[:4]
+
+    # 全て統合
+    final_combined = slot_yakkiho + slot_kehyoho + slot_guideline
     
-    def process_results(raw_docs):
-        if raw_docs and 'documents' in raw_docs and raw_docs['documents']:
-            for i, doc_content in enumerate(raw_docs['documents'][0]):
-                if doc_content not in seen_contents:
-                    metadata = raw_docs['metadatas'][0][i]
-                    # 新しいメタデータ構造に合わせて、全てのヒットを採用（既にインデックス時に精査済みのため）
-                    merged_documents.append(doc_content)
-                    merged_metadatas.append(metadata)
-                    seen_contents.add(doc_content)
-    
-    process_results(docs_statute)
-    process_results(docs_guideline)
-    
-    # 上位10件に絞る（合計）
     final_docs = {
-        "documents": [merged_documents[:10]],
-        "metadatas": [merged_metadatas[:10]]
+        "documents": [[d["content"] for d in final_combined]],
+        "metadatas": [[d["metadata"] for d in final_combined]]
     }
     
-    print(f"Final merged docs count: {len(final_docs['documents'][0])}")
+    print(f"Final merged docs count: {len(final_combined)} (Yakki:{len(slot_yakkiho)}, Kehyo:{len(slot_kehyoho)}, Guide:{len(slot_guideline)})")
     
     return {
         "retrieved_docs": final_docs,
+        "usage_metadata": [usage],
         "debug_info": {
-            "generated_query": f"Statute: {statute_query} | Guideline: {guideline_query}",
-            "retrieved_doc_count": len(final_docs["documents"][0]),
+            "generated_query": f"Y:{queries.get('yakkiho_query')} | K:{queries.get('kehyoho_query')} | G:{queries.get('guideline_query')}",
+            "retrieved_doc_count": len(final_combined),
             "retrieved_doc_titles": [f"{m.get('title', 'Unknown')} - {m.get('section', '')}" for m in final_docs["metadatas"][0]]
         }
     }
@@ -200,16 +231,19 @@ Analyze the compliance:
     try:
         chain = analysis_prompt | llm_gemini
         result = chain.invoke({"input_text": input_text, "docs_context": docs_context})
+        usage = getattr(result, 'usage_metadata', {})
     except Exception as e:
         print(f"Gemini API Error in analyze_compliance: {e}")
         if llm_openai:
             print("Switching to OpenAI for compliance analysis...")
             chain = analysis_prompt | llm_openai
             result = chain.invoke({"input_text": input_text, "docs_context": docs_context})
+            usage = getattr(result, 'usage_metadata', {})
         else:
             raise e
 
     updated_state = state.copy()
+    updated_state["usage_metadata"] = state.get("usage_metadata", []) + [usage]
     updated_state["analysis_result"] = {"irac_analysis": result.content}
     updated_state["current_step"] = "analyze"
 
@@ -244,21 +278,47 @@ def generate_recommendations(state: WorkflowState) -> WorkflowState:
     
     try:
          result = chain.invoke({"input_text": input_text, "analysis_result": analysis_result["irac_analysis"]})
+         usage = getattr(result, 'usage_metadata', {})
     except Exception as e:
          print(f"Gemini API Error in generate_recommendations: {e}")
          if llm_openai:
               print("Switching to OpenAI for recommendations...")
               chain = recommendation_prompt | llm_openai
               result = chain.invoke({"input_text": input_text, "analysis_result": analysis_result["irac_analysis"]})
+              usage = getattr(result, 'usage_metadata', {})
          else:
               raise e
 
     updated_state = state.copy()
+    usage_list = state.get("usage_metadata", []) + [usage]
+    
+    # トークンの合計計算 (詳細なログから再計算)
+    total_input = 0
+    total_output = 0
+    clean_usage_list = []
+    
+    for u in usage_list:
+        if isinstance(u, dict) and u:
+            total_input += u.get('input_tokens', 0)
+            total_output += u.get('output_tokens', 0)
+            clean_usage_list.append(u)
+        elif hasattr(u, 'input_tokens'): # 念のためオブジェクトの場合も考慮
+            total_input += u.input_tokens
+            total_output += u.output_tokens
+            clean_usage_list.append({"input_tokens": u.input_tokens, "output_tokens": u.output_tokens})
+    
     updated_state["final_output"] = {
         "compliant": "適合" in result.content,
         "recommendations": result.content,
-        "analysis_summary": analysis_result["irac_analysis"]
+        "analysis_summary": analysis_result["irac_analysis"],
+        "token_usage": {
+            "input": total_input,
+            "output": total_output,
+            "total": total_input + total_output,
+            "details": usage_list
+        }
     }
+    updated_state["usage_metadata"] = usage_list
     updated_state["current_step"] = "recommend"
 
     print("Recommendations generated")

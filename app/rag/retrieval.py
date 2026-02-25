@@ -43,9 +43,12 @@ def load_sample_documents():
                     # 法律名・条文番号・見出しをコンテンツ先頭に付与してembedding品質を向上させる
                     enriched_content = f"【{law_title}】{section_name} {caption_text}\n{article_text}"
                     
+                    law_group = "yakkiho" if "医薬品" in law_title else "kehyoho" if "不当景品" in law_title else "other"
+                    
                     metadata = {
                         "title": law_title,
                         "category": "01_statute",
+                        "law_group": law_group,
                         "section": section_name,
                         "caption": caption_text,
                         "is_main_provision": True,
@@ -67,9 +70,12 @@ def load_sample_documents():
                     # 附則にもプレフィックスを付与（ただし「附則」を明記）
                     enriched_content = f"【{law_title}・附則】{section_name} {caption_text}\n{article_text}"
                     
+                    law_group = "yakkiho" if "医薬品" in law_title else "kehyoho" if "不当景品" in law_title else "other"
+                    
                     metadata = {
                         "title": law_title,
                         "category": "01_statute",
+                        "law_group": law_group,
                         "section": section_name,
                         "caption": caption_text,
                         "is_main_provision": False,
@@ -102,6 +108,7 @@ def load_sample_documents():
                 metadata = {
                     "title": md_path.stem,
                     "category": category,
+                    "law_group": "other",
                     "section": first_line if first_line else f"Section {i+1}",
                     "source_type": "md",
                     "path": str(md_path.relative_to(source_docs_dir))
@@ -128,6 +135,7 @@ def load_sample_documents():
                 metadata = {
                     "title": pdf_path.stem,
                     "category": category,
+                    "law_group": "other",
                     "section": f"Page {i+1}",
                     "source_type": "pdf",
                     "path": str(pdf_path.relative_to(source_docs_dir))
@@ -248,7 +256,8 @@ async def check_compliance(request: ComplianceCheckRequest) -> ComplianceCheckRe
                     "tool_used": "langgraph"
                 }
             ],
-            "retrieval_debug": result.get("debug_info", {})
+            "retrieval_debug": result.get("debug_info", {}),
+            "token_usage": result.get("final_output", {}).get("token_usage", {})
         }
     }
 
