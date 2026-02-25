@@ -108,10 +108,12 @@ def retrieve_documents(state: WorkflowState):
 
     # 検索の実行（それぞれトップ10件を取得）
     print(f"Executing Search 1 (Statute): {statute_query}")
-    docs_statute = search_documents(statute_query, top_k=10)
+    # カテゴリ：01_statute かつ 本則(is_main_provision: True) に限定して検索
+    docs_statute = search_documents(statute_query, top_k=10, where={"$and": [{"category": "01_statute"}, {"is_main_provision": True}]})
     
     print(f"Executing Search 2 (Guideline): {guideline_query}")
-    docs_guideline = search_documents(guideline_query, top_k=10)
+    # 条文以外（事例や運用基準）を対象に検索
+    docs_guideline = search_documents(guideline_query, top_k=10, where={"category": {"$ne": "01_statute"}})
     
     # 結果の統合と重複排除
     merged_documents = []
@@ -123,14 +125,10 @@ def retrieve_documents(state: WorkflowState):
             for i, doc_content in enumerate(raw_docs['documents'][0]):
                 if doc_content not in seen_contents:
                     metadata = raw_docs['metadatas'][0][i]
-                    # フィルタリング: XML/URLまたはMainフラグ付きのみ
-                    source_type = metadata.get("source_type", "json")
-                    is_main = metadata.get("is_main_provision", True)
-                    
-                    if source_type in ["xml", "url"] or is_main:
-                        merged_documents.append(doc_content)
-                        merged_metadatas.append(metadata)
-                        seen_contents.add(doc_content)
+                    # 新しいメタデータ構造に合わせて、全てのヒットを採用（既にインデックス時に精査済みのため）
+                    merged_documents.append(doc_content)
+                    merged_metadatas.append(metadata)
+                    seen_contents.add(doc_content)
     
     process_results(docs_statute)
     process_results(docs_guideline)

@@ -6,225 +6,149 @@ from app.rag.vector_store import search_documents, initialize_vector_store, get_
 from app.workflow.langgraph import create_workflow
 import json
 import os
+import re
 from pathlib import Path
 
 # サンプル法律文書の読み込みとベクトルストアへの追加（初回のみ）
-# サンプル法律文書の読み込みとベクトルストアへの追加（初回のみ）
 def load_sample_documents():
     documents = []
-    print("Loading legal documents...")
+    print("Loading legal documents with semantic chunking...")
     
-    # 1. JSONファイルの読み込み（既存）
-    legal_docs_dir = Path(__file__).parent.parent.parent / "data" / "legal_documents"
-    if legal_docs_dir.exists():
-        for file_path in legal_docs_dir.glob("*.json"):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        for item in data:
-                            metadata = {
-                                "title": item["title"],
-                                "law_category": item["law_category"],
-                                "section": item["section"],
-                                "tags": ", ".join(item["tags"]) if isinstance(item["tags"], list) else str(item["tags"]),
-                                "source_type": "json"
-                            }
-                            if "metadata" in item:
-                                metadata.update(item["metadata"])
-                            documents.append({"content": item["content"], "metadata": metadata})
-                    elif isinstance(data, dict):
-                        metadata = {
-                            "title": data["title"],
-                            "law_category": data["law_category"],
-                            "section": data["section"],
-                            "tags": ", ".join(data["tags"]) if isinstance(data["tags"], list) else str(data["tags"]),
-                            "source_type": "json"
-                        }
-                        if "metadata" in data:
-                            metadata.update(data["metadata"])
-                        documents.append({"content": data["content"], "metadata": metadata})
-            except Exception as e:
-                print(f"Error loading JSON {file_path}: {e}")
+    source_docs_dir = Path(__file__).parent.parent.parent / "source_docs"
+    if not source_docs_dir.exists():
+        print(f"Directory not found: {source_docs_dir}")
+        return documents
 
-    # 2. XMLファイルの読み込み（新規: 法律文書フォルダ）
-    # プロジェクトルートの「source_docs」フォルダを参照
-    xml_docs_dir = Path(__file__).parent.parent.parent / "source_docs"
-    if xml_docs_dir.exists():
-        from bs4 import BeautifulSoup
-        print(f"Scanning XML documents in: {xml_docs_dir}")
-        for file_path in xml_docs_dir.glob("*.xml"):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                soup = BeautifulSoup(content, 'xml')
-                law_title = soup.find('LawTitle').text if soup.find('LawTitle') else file_path.stem
-                
-                # <Article>タグ単位で抽出
-                articles = soup.find_all('Article')
-                print(f"Found {len(articles)} articles in {file_path.name}")
-                
+    # 1. XML形式 (01_条文など): 条文単位で分割
+    for xml_path in source_docs_dir.rglob("*.xml"):
+        try:
+            with open(xml_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(content, 'xml')
+            law_title = soup.find('LawTitle').text if soup.find('LawTitle') else xml_path.stem
+            
+            # 本則 (MainProvision) の抽出
+            main_provision = soup.find('MainProvision')
+            if main_provision:
+                articles = main_provision.find_all('Article')
                 for article in articles:
-                    article_caption = article.find('ArticleCaption')
-                    article_title = article.find('ArticleTitle')
-                    
-                    # 条文番号の抽出 (例: "第六十六条")
-                    section_name = article_title.text if article_title else "不明"
-                    caption_text = article_caption.text if article_caption else ""
-                    
-                    # 本文の抽出（Articleタグ内のテキストを結合、ただしXMLタグは除去）
-                    # get_text()でタグを除去してテキストのみ取得
+                    section_name = article.find('ArticleTitle').text if article.find('ArticleTitle') else "不明"
+                    caption = article.find('ArticleCaption')
+                    caption_text = caption.text if caption else ""
                     article_text = article.get_text(separator="\n", strip=True)
                     
-                    # メタデータの作成
+                    # ★ ベクトル検索の精度向上: 条文の内容にプレフィックスを付与
+                    # ChromaDBのデフォルトembeddingは日本語法律文の意味区別が困難なため、
+                    # 法律名・条文番号・見出しをコンテンツ先頭に付与してembedding品質を向上させる
+                    enriched_content = f"【{law_title}】{section_name} {caption_text}\n{article_text}"
+                    
                     metadata = {
                         "title": law_title,
-                        "law_category": "General Law", # 法律名から推測するか、一律設定
+                        "category": "01_statute",
                         "section": section_name,
                         "caption": caption_text,
-                        "tags": f"{law_title}, {section_name}, {caption_text}",
+                        "is_main_provision": True,
                         "source_type": "xml",
-                        "is_main_provision": True # XMLからの条文は全て重要とみなす
+                        "path": str(xml_path.relative_to(source_docs_dir))
                     }
-                    
-                    documents.append({
-                        "content": article_text,
-                        "metadata": metadata
-                    })
-            except Exception as e:
-                print(f"Error loading XML {file_path}: {e}")
+                    documents.append({"content": enriched_content, "metadata": metadata})
 
-    # 3. URLガイドラインの読み込み（新規）
-    # 「source_docs/web資料-条文を具体的に解釈するために行政資料」からURLを読み込む
-    guideline_file = xml_docs_dir / "web資料-条文を具体的に解釈するために行政資料"
-    # ファイル名に拡張子がない場合も考慮
-    if not guideline_file.exists():
-         guideline_file = xml_docs_dir / "web資料-条文を具体的に解釈するために行政資料.txt"
-
-    if guideline_file.exists():
-        import requests
-        from bs4 import BeautifulSoup
-        print(f"Loading guidelines from: {guideline_file}")
-        
-        try:
-            with open(guideline_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            urls = []
-            for line in lines:
-                line = line.strip()
-                if line.startswith("http"):
-                    urls.append(line)
-            
-            print(f"Found {len(urls)} URLs to scrape.")
-            
-            for url in urls:
-                try:
-                    # 簡易的なスクレイピング
-                    response = requests.get(url, timeout=10)
-                    response.raise_for_status()
-                    # エンコーディングの自動検出補正
-                    response.encoding = response.apparent_encoding
+            # 附則 (SupplProvision) の抽出
+            suppl_provisions = soup.find_all('SupplProvision')
+            for suppl in suppl_provisions:
+                articles = suppl.find_all('Article')
+                for article in articles:
+                    section_name = article.find('ArticleTitle').text if article.find('ArticleTitle') else "不明"
+                    caption = article.find('ArticleCaption')
+                    caption_text = caption.text if caption else ""
+                    article_text = article.get_text(separator="\n", strip=True)
                     
-                    soup = BeautifulSoup(response.text, 'html.parser')
+                    # 附則にもプレフィックスを付与（ただし「附則」を明記）
+                    enriched_content = f"【{law_title}・附則】{section_name} {caption_text}\n{article_text}"
                     
-                    # 本文抽出（scriptやstyleを除く）
-                    for script in soup(["script", "style"]):
-                        script.decompose()
-                    
-                    text = soup.get_text(separator="\n", strip=True)
-                    title = soup.title.string if soup.title else url
-                    
-                    # テキストが長すぎる場合は分割する（簡易チャンキング）
-                    chunk_size = 2000
-                    text_chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-                    
-                    for i, chunk in enumerate(text_chunks):
-                        metadata = {
-                            "title": f"{title} (Part {i+1})",
-                            "law_category": "Administrative Guideline",
-                            "section": "Guideline",
-                            "tags": "Guideline, Web",
-                            "source_type": "url",
-                            "url": url
-                        }
-                        documents.append({
-                            "content": chunk,
-                            "metadata": metadata
-                        })
-                    print(f"Successfully loaded content from {url}")
-                    
-                except Exception as e:
-                    print(f"Error scraping {url}: {e}")
-
+                    metadata = {
+                        "title": law_title,
+                        "category": "01_statute",
+                        "section": section_name,
+                        "caption": caption_text,
+                        "is_main_provision": False,
+                        "source_type": "xml",
+                        "path": str(xml_path.relative_to(source_docs_dir))
+                    }
+                    documents.append({"content": enriched_content, "metadata": metadata})
         except Exception as e:
-            print(f"Error reading guideline file: {e}")
+            print(f"Error loading XML {xml_path}: {e}")
 
-    # 4. PDFファイルの読み込み（新規）
-    # 「source_docs」フォルダ内のPDFファイルをスキャン
-    if xml_docs_dir.exists():
+    # 2. Markdown形式 (02_OK事例, 03_NG事例, 04_運用基準など): 見出し単位で分割
+    for md_path in source_docs_dir.rglob("*.md"):
         try:
-            import pypdf
-            print(f"Scanning PDF documents in: {xml_docs_dir}")
-            for file_path in xml_docs_dir.glob("*.pdf"):
-                try:
-                    print(f"Loading PDF: {file_path.name}")
-                    reader = pypdf.PdfReader(file_path)
-                    pdf_text = ""
-                    for page in reader.pages:
-                        extracted = page.extract_text()
-                        if extracted:
-                            pdf_text += extracted + "\n"
-                    
-                    # テキストが長すぎる場合は分割する（簡易チャンキング）
-                    chunk_size = 2000
-                    text_chunks = [pdf_text[i:i+chunk_size] for i in range(0, len(pdf_text), chunk_size)]
-                    
-                    for i, chunk in enumerate(text_chunks):
-                        metadata = {
-                            "title": file_path.stem + f" (Part {i+1})",
-                            "law_category": "Administrative Guideline/PDF",
-                            "section": "PDF Content",
-                            "tags": "PDF, Guideline",
-                            "source_type": "pdf",
-                            "filename": file_path.name
-                        }
-                        documents.append({
-                            "content": chunk,
-                            "metadata": metadata
-                        })
-                    print(f"Successfully loaded content from {file_path.name}")
-                except Exception as e:
-                    print(f"Error loading PDF {file_path}: {e}")
-        except ImportError:
-            print("pypdf is not installed. Skipping PDF loading.")
+            with open(md_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # ディレクトリ名からカテゴリを推測
+            parent_dir = md_path.parent.name
+            category = "unknown"
+            if "02" in parent_dir: category = "02_ok_example"
+            elif "03" in parent_dir: category = "03_ng_example"
+            elif "04" in parent_dir: category = "04_standard"
+
+            # 見出し（#）で分割
+            chunks = re.split(r'\n(?=# )', content)
+            for i, chunk in enumerate(chunks):
+                if not chunk.strip(): continue
+                # 最初の1行を見出し（セクション名）として抽出
+                first_line = chunk.split('\n')[0].replace('#', '').strip()
+                metadata = {
+                    "title": md_path.stem,
+                    "category": category,
+                    "section": first_line if first_line else f"Section {i+1}",
+                    "source_type": "md",
+                    "path": str(md_path.relative_to(source_docs_dir))
+                }
+                documents.append({"content": chunk.strip(), "metadata": metadata})
         except Exception as e:
-            print(f"Error initializing PDF loader: {e}")
+            print(f"Error loading MD {md_path}: {e}")
+
+    # 3. PDF形式: ページ単位または一定文字数で分割（改良案）
+    import pypdf
+    for pdf_path in source_docs_dir.rglob("*.pdf"):
+        try:
+            reader = pypdf.PdfReader(pdf_path)
+            # ディレクトリ名からカテゴリを推測
+            parent_dir = pdf_path.parent.name
+            category = "04_standard" # デフォルト
+            if "02" in parent_dir: category = "02_ok_example"
+            elif "03" in parent_dir: category = "03_ng_example"
+
+            for i, page in enumerate(reader.pages):
+                page_text = page.extract_text()
+                if not page_text or len(page_text.strip()) < 50: continue
+                
+                metadata = {
+                    "title": pdf_path.stem,
+                    "category": category,
+                    "section": f"Page {i+1}",
+                    "source_type": "pdf",
+                    "path": str(pdf_path.relative_to(source_docs_dir))
+                }
+                documents.append({"content": page_text.strip(), "metadata": metadata})
+        except Exception as e:
+            print(f"Error loading PDF {pdf_path}: {e}")
 
     return documents
 
+
 # 初期化時にサンプルドキュメントをロード
 try:
-    # 既存のDBを削除して再構築するために、明示的に初期化を呼び出す前に
-    # ディレクトリチェックなどをここでやるべきだが、initialize_vector_store内で
-    # 既存データをどう扱うかによる。今回は「追加」ではなく「再構築」が望ましいので
-    # vector_store.py の initialize_vector_store が既存データをクリアするか確認が必要。
-    # 実装上は追記型が多いので、本当はリセットが必要。
-    # 簡易的に、サーバー起動時に data/chroma_db を削除するバッチ処理などがベターだが、
-    # Pythonコード内でやるなら shutil.rmtree 等が必要。
-    # 今回は安全のため「追記」動作のままとするが、重複の可能性がある。
-    # ※ 本番運用ではID管理が必要。
-    
-    current_count = get_collection_count()
-    if current_count == 0:
-        print("Initializing vector store for the first time...")
-        sample_docs = load_sample_documents()
-        if sample_docs:
-            print(f"Total documents to index: {len(sample_docs)}")
-            initialize_vector_store(sample_docs)
-    else:
-        print(f"Vector store already contains {current_count} documents. Skipping initialization.")
+    # 既存のカウントに関わらず、再構築が必要な場合はここを調整
+    # 今回は initialize_vector_store 内でリセットを行うようにしたため、
+    # 常に最新の source_docs を反映するように再初期化を実行する設計とする。
+    print("Re-indexing source documents for semantic optimization...")
+    sample_docs = load_sample_documents()
+    if sample_docs:
+        print(f"Total documents to index: {len(sample_docs)}")
+        initialize_vector_store(sample_docs)
 except Exception as e:
     print(f"Warning: Could not initialize vector store with sample documents: {e}")
 
